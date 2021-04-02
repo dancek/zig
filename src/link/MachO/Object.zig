@@ -170,6 +170,85 @@ pub fn readLoadCommands(self: *Object, reader: anytype) !void {
     }
 }
 
+const PageReloc = struct {
+    const Kind = enum {
+        Normal,
+        Got,
+        Tlv,
+    };
+
+    const TargetType = enum {
+        Symbol,
+        Section,
+    };
+
+    kind: Kind,
+    target_type: TargetType,
+    // TODO preprocess target based on whether it is local to CU, or extern
+    target: u32,
+    page_op: struct {
+        addend: ?u32 = null,
+        offset: i32,
+    },
+    pageoff_op: struct {
+        addend: ?u32 = null,
+        offset: i32,
+    },
+};
+
+fn parsePageOff12Reloc(reloc: macho.relocation_info, addend: ?u32) PageReloc {
+    assert(reloc.r_length == 2);
+    assert(reloc.r_pcrel == 0);
+
+    const kind: PageReloc.Kind = switch (@intToEnum(macho.reloc_type_arm64, reloc.r_type)) {
+        .ARM64_RELOC_PAGEOFF12 => .Normal,
+        .ARM64_RELOC_GOT_LOAD_PAGEOFF12 => .Got,
+        .ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => .Tlv,
+        else => unreachable,
+    };
+
+    const target_type: PageReloc.TargetType = if (reloc.r_extern == 1) .Symbol else .Section;
+    const target = if (reloc.r_extern == 1) reloc.r_symbolnum else reloc.r_symbolnum - 1;
+
+    return .{
+        .kind = kind,
+        .target_type = target_type,
+        .target = target,
+        .pageoff_op = .{
+            .addend = addend,
+            .offset = reloc.r_address,
+        },
+        .page_op = undefined,
+    };
+}
+
+fn parsePage21Reloc(reloc: macho.relocation_info, addend: ?u32, page_reloc: *PageReloc) void {
+    assert(reloc.r_length == 2);
+    assert(reloc.r_pcrel == 1);
+
+    const kind: PageReloc.Kind = switch (@intToEnum(macho.reloc_type_arm64, reloc.r_type)) {
+        .ARM64_RELOC_PAGE21 => .Normal,
+        .ARM64_RELOC_GOT_LOAD_PAGE21 => .Got,
+        .ARM64_RELOC_TLVP_LOAD_PAGE21 => .Tlv,
+        else => unreachable,
+    };
+    const target_type: PageReloc.TargetType = if (reloc.r_extern == 1) .Symbol else .Section;
+
+    assert(kind == page_reloc.kind);
+    assert(target_type == page_reloc.target_type);
+
+    if (reloc.r_extern == 1) {
+        assert(reloc.r_symbolnum == page_reloc.target);
+    } else {
+        assert(reloc.r_symbolnum - 1 == page_reloc.target);
+    }
+
+    page_reloc.page_op = .{
+        .addend = addend,
+        .offset = reloc.r_address,
+    };
+}
+
 pub fn parseRelocs(self: *Object, sect_id: u16) !void {
     const seg = self.load_commands.items[self.segment_cmd_index.?].Segment;
     const sect = seg.sections.items[sect_id];
@@ -181,43 +260,70 @@ pub fn parseRelocs(self: *Object, sect_id: u16) !void {
     _ = try self.file.?.preadAll(raw_relocs, sect.reloff);
     const relocs = mem.bytesAsSlice(macho.relocation_info, raw_relocs);
 
-    for (relocs) |reloc| {
-        const is_addend = is_addend: {
-            switch (self.arch.?) {
-                .x86_64 => {
-                    const rel_type = @intToEnum(macho.reloc_type_x86_64, reloc.r_type);
-                    log.warn("{s}", .{rel_type});
+    var fifo = std.fifo.LinearFifo(PageReloc, .Dynamic).init(self.allocator);
+    defer fifo.deinit();
 
-                    break :is_addend false;
-                },
-                .aarch64 => {
-                    const rel_type = @intToEnum(macho.reloc_type_arm64, reloc.r_type);
-                    log.warn("{s}", .{rel_type});
+    var i: usize = 0;
+    while (i < relocs.len) : (i += 1) {
+        const reloc = relocs[i];
+        const rel_type = @intToEnum(macho.reloc_type_arm64, reloc.r_type);
 
-                    break :is_addend rel_type == .ARM64_RELOC_ADDEND;
-                },
-                else => unreachable,
-            }
-        };
-
-        if (!is_addend) {
-            if (reloc.r_extern == 1) {
-                const sym = self.symtab.items[reloc.r_symbolnum];
-                const sym_name = self.getString(sym.inner.n_strx);
-                log.warn("    | symbol = {s}", .{sym_name});
-            } else {
-                const target_sect = seg.sections.items[reloc.r_symbolnum - 1];
-                log.warn("    | section = {s},{s}", .{
-                    parseName(&target_sect.segname),
-                    parseName(&target_sect.sectname),
-                });
-            }
-        }
-
-        log.warn("    | offset = 0x{x}", .{reloc.r_address});
+        log.warn("{s}", .{rel_type});
+        log.warn("    | offset = {}", .{reloc.r_address});
         log.warn("    | PC = {}", .{reloc.r_pcrel == 1});
         log.warn("    | length = {}", .{reloc.r_length});
+        log.warn("    | symbolnum = {}", .{reloc.r_symbolnum});
+
+        switch (rel_type) {
+            .ARM64_RELOC_ADDEND => {
+                const next_reloc = relocs[i + 1];
+                i += 1;
+
+                log.warn("{s}", .{@intToEnum(macho.reloc_type_arm64, next_reloc.r_type)});
+                log.warn("    | offset = {}", .{next_reloc.r_address});
+                log.warn("    | PC = {}", .{next_reloc.r_pcrel == 1});
+                log.warn("    | length = {}", .{next_reloc.r_length});
+                log.warn("    | symbolnum = {}", .{next_reloc.r_symbolnum});
+
+                switch (@intToEnum(macho.reloc_type_arm64, next_reloc.r_type)) {
+                    .ARM64_RELOC_PAGE21, .ARM64_RELOC_GOT_LOAD_PAGE21, .ARM64_RELOC_TLVP_LOAD_PAGE21 => {
+                        var page_reloc = fifo.readItem() orelse unreachable;
+                        parsePage21Reloc(next_reloc, reloc.r_symbolnum, &page_reloc);
+
+                        log.warn("    | emitting {}", .{page_reloc});
+                        // TODO save the combined reloc
+                    },
+                    .ARM64_RELOC_PAGEOFF12, .ARM64_RELOC_GOT_LOAD_PAGEOFF12, .ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+                        var page_reloc = parsePageOff12Reloc(next_reloc, reloc.r_symbolnum);
+                        try fifo.writeItem(page_reloc);
+                    },
+                    else => {
+                        log.err("unexpected reloc type after ADDEND: expected either PAGE21 or PAGEOFF12, got {s}", .{@intToEnum(
+                            macho.reloc_type_arm64,
+                            reloc.r_type,
+                        )});
+                        // TODO we probably should continue parsing the relocs anyway reporting any other errors along the way?
+                        return error.InvalidRelocAfterAddend;
+                    },
+                }
+            },
+            .ARM64_RELOC_PAGEOFF12, .ARM64_RELOC_GOT_LOAD_PAGEOFF12, .ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+                var page_reloc = parsePageOff12Reloc(reloc, null);
+                try fifo.writeItem(page_reloc);
+            },
+            .ARM64_RELOC_PAGE21, .ARM64_RELOC_GOT_LOAD_PAGE21, .ARM64_RELOC_TLVP_LOAD_PAGE21 => {
+                var page_reloc = fifo.readItem() orelse unreachable;
+                parsePage21Reloc(reloc, null, &page_reloc);
+
+                log.warn("    | emitting {}", .{page_reloc});
+                // TODO save the combined reloc
+
+            },
+            else => {},
+        }
     }
+
+    assert(fifo.count == 0);
 }
 
 pub fn parseSymtab(self: *Object) !void {
